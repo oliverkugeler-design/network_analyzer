@@ -36,7 +36,7 @@ import math
 import os
 from dataclasses import dataclass
 from typing import Iterable, Tuple, Optional
-
+import time
 import pyvisa
 
 
@@ -80,22 +80,129 @@ def idn(sess: PNASession) -> str:
 # -------------------------
 # Measurement setup
 # -------------------------
-def ensure_measurement(sess: PNASession, param: str = "S21", meas_name: str = "Meas1", ch: int = 1) -> None:
-    """Create/select measurement PARAM (S11/S21/…) named meas_name on channel ch and feed it to Trace1."""
+def clear_error_queue(sess: PNASession, max_reads: int = 8):
+    for _ in range(max_reads):
+        try:
+            err = query(sess, "SYST:ERR?")
+        except Exception:
+            break
+        if err.startswith("+0") or "No error" in err:
+            break
+
+def scpi_ok(sess: PNASession, cmd: str) -> bool:
+    """Schreibe cmd, prüfe danach kurz die Error-Queue. True = kein Fehler eingetragen."""
+    try:
+        scpi(sess, cmd)
+        # Viele PNAs loggen Fehler synchr., direkt abfragen:
+        e = query(sess, "SYST:ERR?")
+        return (e.startswith("+0") or "No error" in e)
+    except Exception:
+        return False
+
+def list_measurements(sess: PNASession, ch: int = 1) -> list[tuple[str,str]]:
+    """Liest CALC:PAR:CAT? und parst [('Meas1','S11'), ...]."""
+    try:
+        cat = query(sess, f"CALC{ch}:PAR:CAT?")
+        # Format: 'Meas1,S11,Meas2,S21' oder leere Zeichenkette
+        parts = [p.strip(" '") for p in cat.split(",") if p.strip()]
+        return [(parts[i], parts[i+1]) for i in range(0, len(parts), 2)]
+    except Exception:
+        return []
+
+def ensure_measurement(sess, param="S21", meas_name="Meas1", ch=1):
     param = param.upper()
     scpi(sess, "*CLS")
-    # Delete old to avoid CALC conflicts on older firmware
+    scpi(sess, "DISP:WIND:DEL:ALL")
     scpi(sess, f"CALC{ch}:PAR:DEL:ALL")
-    scpi(sess, f"CALC{ch}:PAR:DEF:EXT '{meas_name}','{param}'")
-    scpi(sess, f"CALC{ch}:PAR:SEL '{meas_name}'")
+    scpi(sess, f"CALC{ch}:PAR:COUN 1")
+    scpi(sess, f"CALC{ch}:PAR1:DEF {param}")
+    scpi(sess, f"CALC{ch}:PAR1:SEL")
     scpi(sess, "DISP:WIND1:STATE ON")
-    scpi(sess, f"DISP:WIND1:TRAC1:FEED '{meas_name}'")
-    # Display format as needed; we'll fetch formatted (FDATA) but keep ASCII globally
+    scpi(sess, "DISP:WIND1:TRAC1:STAT ON")
+    scpi(sess, "DISP:WIND1:TRAC1:FEED 1")
     scpi(sess, f"CALC{ch}:FORM MLOG")
-    # ASCII data format (very important on A.06.x)
     scpi(sess, "FORM:DATA ASCII")
-    # Make sure output on
+    scpi(sess, f"SENS{ch}:AVER:STAT OFF")
+    scpi(sess, "TRIG:SOUR IMM")   # wichtig: nicht TRIG:SEQ:SOUR
     scpi(sess, "OUTP ON")
+
+
+
+def ensure_measurement_old(sess: PNASession, param: str = "S21", meas_name: str = "Meas1", ch: int = 1) -> None:
+    """
+    Legt eine Messung (param) auf Channel ch an, erzeugt Fenster/Trace1 und FEEDed die Messung darauf.
+    Probiert mehrere SCPI-Dialekte (DEF:EXT / DEF / MEAS) und prüft am Ende hart,
+    dass mind. 1 Messung existiert und TRAC1 gefüttert ist.
+    """
+    param = param.upper()
+    scpi(sess, "*CLS")
+    clear_error_queue(sess)
+
+    # Mindestens 1 Channel/Window/Trace präsent
+    scpi_ok(sess, "SYST:CHAN:COUN 1")               # manche PNAs brauchen das
+    scpi_ok(sess, "DISP:WIND1:STATE ON")
+    scpi_ok(sess, "DISP:WIND1:ACT")
+    # Alle alten Traces/Messungen entfernen (Reihenfolge ist hier wichtig)
+    scpi_ok(sess, f"DISP:WIND1:TRAC:DEL:ALL")
+    scpi_ok(sess, f"CALC{ch}:PAR:DEL:ALL")
+
+    # ---- Messung definieren (mehrere Varianten versuchen) ----
+    defined = (
+        scpi_ok(sess, f"CALC{ch}:PAR:DEF:EXT '{meas_name}','{param}'") or
+        scpi_ok(sess, f"CALC{ch}:PAR:DEF '{meas_name}','{param}'")     or
+        scpi_ok(sess, f"CALC{ch}:PAR:MEAS '{meas_name}','{param}'")
+    )
+    # Falls der Name nicht akzeptiert wurde, gibt es evtl. eine auto-generierte Messung:
+    meas_list = list_measurements(sess, ch=ch)
+    if not defined and not meas_list:
+        raise RuntimeError("Failed to define a measurement – device rejected all SCPI variants.")
+
+    # Effektiven Messungsnamen bestimmen (falls Gerät umbenannt hat)
+    eff_meas = meas_name
+    if not any(m == meas_name for (m, p) in meas_list):
+        # nimm die erste Messung mit passendem Param, sonst erste überhaupt
+        cand = next((m for (m, p) in meas_list if p.upper() == param), None)
+        eff_meas = cand or (meas_list[0][0] if meas_list else meas_name)
+
+    # Messung auswählen
+    scpi_ok(sess, f"CALC{ch}:PAR:SEL '{eff_meas}'")
+
+    # ---- Trace1 neu anlegen/füttern ----
+    # Manche PNAs verlangen erst eine "Definition", andere nur FEED:
+    # 1) Versuch: FEED reicht
+    fed = scpi_ok(sess, f"DISP:WIND1:TRAC1:FEED '{eff_meas}'")
+    # 2) Versuch: explizit Trace „definieren“ (Dialekt)
+    if not fed:
+        fed = scpi_ok(sess, "DISP:WIND1:TRAC1:STAT ON") and scpi_ok(sess, f"DISP:WIND1:TRAC1:FEED '{eff_meas}'")
+    # 3) Letzter Versuch: eine neue Spur anlegen und füttern
+    if not fed:
+        scpi_ok(sess, "DISP:WIND1:TRAC:DEL:ALL")
+        scpi_ok(sess, "DISP:WIND1:TRAC1:STAT ON")
+        fed = scpi_ok(sess, f"DISP:WIND1:TRAC1:FEED '{eff_meas}'")
+
+    # Anzeigeformat/ASCII/Averages/Trigger
+    scpi_ok(sess, f"CALC{ch}:FORM MLOG")
+    scpi_ok(sess, "FORM:DATA ASCII")
+    scpi_ok(sess, f"SENS{ch}:AVER:STAT OFF")
+    scpi_ok(sess, "TRIG:SEQ:SOUR IMM")
+    scpi_ok(sess, "OUTP ON")
+
+    # ---- Verifikation: gibt es Messung + Trace? ----
+    meas_list = list_measurements(sess, ch=ch)
+    if not meas_list:
+        raise RuntimeError("No measurement present after setup.")
+    try:
+        feedq = query(sess, "DISP:WIND1:TRAC1:FEED?")
+    except Exception:
+        feedq = ""
+    if eff_meas not in feedq:
+        # Manche Geräte liefern den vollen Kanalpräfix im Feed-String – lockerer Check:
+        if not feedq or (eff_meas.split("_")[0] not in feedq):
+            raise RuntimeError(f"Trace1 is not fed by measurement (FEED? -> {feedq!r}).")
+
+    clear_error_queue(sess)
+
+
 
 def configure_sweep(sess: PNASession,
                     center_hz: float,
@@ -112,18 +219,53 @@ def configure_sweep(sess: PNASession,
     scpi(sess, f"INIT{ch}:CONT 0")     # single
     scpi(sess, "TRIG:SEQ:SOUR IMM")    # immediate trigger
 
-def run_single_sweep(sess: PNASession, ch: int = 1, timeout_s: float = 90.0) -> bool:
-    """Start a single sweep and block until done via repeated *OPC? to tolerate A.06 latency."""
-    scpi(sess, "ABOR")
-    scpi(sess, f"INIT{ch}:IMM")
-    # Poll *OPC? because some old FW won’t resolve inline INIT;OPC? reliably
-    sess.inst.timeout = int(timeout_s * 1000)
-    done = query(sess, "*OPC?")
-    return done == "1"
+import time
 
-def get_frequency_axis(sess: PNASession, ch: int = 1) -> Iterable[float]:
-    freqs_csv = query(sess, f"SENS{ch}:FREQ:DATA?")
-    return [float(v) for v in freqs_csv.split(",") if v]
+def run_single_sweep(sess: PNASession, ch: int = 1, timeout_s: float = 90.0) -> bool:
+    """
+    Startet einen Single-Sweep robust.
+    1) Single-Mode, Immediate-Trigger
+    2) Erst *OPC?-Wartepfad versuchen
+    3) Fallback: SENS:SWE:TIME? abfragen und “schlafen”
+    """
+    scpi(sess, "*CLS")
+    scpi(sess, f"INIT{ch}:CONT OFF")
+    scpi(sess, "TRIG:SEQ:SOUR IMM")
+    scpi(sess, f"SENS{ch}:SWE:COUN 1")
+
+    # Versuch 1: klassisch mit *OPC?
+    try:
+        sess.inst.timeout = int(timeout_s * 1000)
+        scpi(sess, f"INIT{ch}:IMM")
+        done = query(sess, "*OPC?")
+        if done.strip() == "1":
+            return True
+    except Exception:
+        pass
+
+    # Versuch 2: deterministischer Fallback – Sweepzeit + Puffer
+    try:
+        swt = float(query(sess, f"SENS{ch}:SWE:TIME?"))
+        # Sicherheitsaufschlag
+        time.sleep(min(timeout_s, 1.3 * max(0.05, swt)))
+        return True
+    except Exception:
+        # Letzter Fallback: kurze Wartezeit
+        time.sleep(min(timeout_s, 2.0))
+        return False
+
+def get_frequency_axis(sess: PNASession, ch: int = 1) -> list[float]:
+    """
+    Robuste Achse aus STAR/STOP/POIN bauen (ältere Firmware mag FREQ:DATA? nicht).
+    """
+    f_start = float(query(sess, f"SENS{ch}:FREQ:STAR?"))
+    f_stop  = float(query(sess, f"SENS{ch}:FREQ:STOP?"))
+    npt     = int(float(query(sess, f"SENS{ch}:SWE:POIN?")))
+    if npt < 2:
+        return [f_start]
+    step = (f_stop - f_start) / (npt - 1)
+    return [f_start + i * step for i in range(npt)]
+
 
 def fetch_fdata(sess: PNASession, ch: int = 1) -> Iterable[float]:
     """Formatted data in current CALC form (e.g., MLOG in dB). ASCII enforced."""
@@ -157,6 +299,19 @@ def fetch_trace(sess: PNASession, ch: int = 1) -> Tuple[list, list, list, str]:
         re, im = fetch_sdata_complex(sess, ch)
         n = min(len(freq), len(re), len(im))
         return freq[:n], re[:n], im[:n], "SDATA"
+
+def debug_measurement_state(sess: PNASession, ch: int = 1):
+    try:
+        cat = query(sess, f"CALC{ch}:PAR:CAT?")
+        print(f"[DBG] CALC{ch}:PAR:CAT? -> {cat}")
+        tr1 = query(sess, "DISP:WIND1:TRAC1:FEED?")
+        print(f"[DBG] TRAC1:FEED? -> {tr1}")
+        fmt = query(sess, f"CALC{ch}:FORM?")
+        print(f"[DBG] CALC{ch}:FORM? -> {fmt}")
+        bw  = query(sess, f"SENS{ch}:BWID?")
+        print(f"[DBG] IFBW -> {bw} Hz")
+    except Exception as e:
+        print("[DBG] State check failed:", e)
 
 
 # -------------------------
